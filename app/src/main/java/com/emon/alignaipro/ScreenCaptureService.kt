@@ -3,6 +3,7 @@ package com.emon.alignaipro
 import android.app.*
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
@@ -32,13 +33,16 @@ class ScreenCaptureService : Service() {
     private var projection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var reader: ImageReader? = null
-    private var detector = ObjectDetection.getClient(
-        ObjectDetectorOptions.Builder().setDetectorMode(ObjectDetectorOptions.STREAM_MODE)
-            .enableMultipleObjects().enableClassification().build()
-    )
     private var busy = false
     private lateinit var worker: Handler
     private lateinit var thread: HandlerThread
+    private val prefs by lazy { getSharedPreferences("align_ai_settings", MODE_PRIVATE) }
+    private val detector by lazy {
+        ObjectDetection.getClient(
+            ObjectDetectorOptions.Builder().setDetectorMode(ObjectDetectorOptions.STREAM_MODE)
+                .enableMultipleObjects().enableClassification().build()
+        )
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -48,72 +52,100 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_START) startCapture(intent)
+        if (intent?.action == ACTION_START) startCapture(intent, startId)
         return START_NOT_STICKY
     }
 
-    private fun startCapture(intent: Intent) {
-        startForeground(NOTIFICATION_ID, notification())
-        val code = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
-        val data = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(EXTRA_DATA, Intent::class.java)
-            else @Suppress("DEPRECATION") intent.getParcelableExtra(EXTRA_DATA)
-        if (code != Activity.RESULT_OK || data == null) { stopSelf(); return }
-        val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        projection = mgr.getMediaProjection(code, data)
-        val metrics = DisplayMetrics()
-        @Suppress("DEPRECATION")
-        (getSystemService(WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(metrics)
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-        reader?.setOnImageAvailableListener({ source ->
-            val image = source.acquireLatestImage() ?: return@setOnImageAvailableListener
-            if (!busy) {
-                busy = true
-                val bitmap = imageToBitmap(image)
-                image.close()
-                if (bitmap != null) analyse(bitmap) else busy = false
-            } else image.close()
-        }, worker)
-        virtualDisplay = projection?.createVirtualDisplay(
-            "AlignAIProCapture", width, height, metrics.densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader?.surface, null, worker
-        )
-        projection?.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() { stopCapture() }
-        }, worker)
-        getSharedPreferences("align_ai_settings", MODE_PRIVATE).edit().putBoolean("capture_running", true).apply()
+    private fun startCapture(intent: Intent, startId: Int) {
+        try {
+            // Android 14+ requires this service to enter foreground with the mediaProjection type.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIFICATION_ID, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+            } else {
+                startForeground(NOTIFICATION_ID, notification())
+            }
+            val code = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+            val data = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(EXTRA_DATA, Intent::class.java)
+                else @Suppress("DEPRECATION") intent.getParcelableExtra(EXTRA_DATA)
+            if (code != Activity.RESULT_OK || data == null) {
+                setError("Screen capture permission was not granted.")
+                stopSelf(startId)
+                return
+            }
+            val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            projection = mgr.getMediaProjection(code, data)
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            (getSystemService(WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(metrics)
+            val width = metrics.widthPixels
+            val height = metrics.heightPixels
+            reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3)
+            reader?.setOnImageAvailableListener({ source ->
+                val image = source.acquireLatestImage() ?: return@setOnImageAvailableListener
+                if (!busy) {
+                    busy = true
+                    val bitmap = imageToBitmap(image)
+                    image.close()
+                    if (bitmap != null) analyse(bitmap) else busy = false
+                } else image.close()
+            }, worker)
+
+            // Register the callback before creating the virtual display (required by newer Android releases).
+            projection?.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() { stopCaptureResources() }
+            }, worker)
+
+            virtualDisplay = projection?.createVirtualDisplay(
+                "AlignAIProCapture", width, height, metrics.densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader?.surface, null, worker
+            )
+            if (virtualDisplay == null) throw IllegalStateException("Android did not create the capture display.")
+            prefs.edit().putBoolean("capture_running", true).putString("capture_error", "").apply()
+        } catch (e: Exception) {
+            setError("Capture could not start: ${e.javaClass.simpleName}: ${e.message ?: "unknown error"}")
+            stopCaptureResources()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf(startId)
+        }
     }
 
     private fun imageToBitmap(image: Image): Bitmap? = try {
         val plane = image.planes[0]
-        val buffer = plane.buffer
-        val pixelStride = plane.pixelStride
-        val rowStride = plane.rowStride
-        val rowPadding = rowStride - pixelStride * image.width
-        val padded = Bitmap.createBitmap(image.width + rowPadding / pixelStride, image.height, Bitmap.Config.ARGB_8888)
-        padded.copyPixelsFromBuffer(buffer)
+        val rowPadding = plane.rowStride - plane.pixelStride * image.width
+        val padded = Bitmap.createBitmap(image.width + rowPadding / plane.pixelStride, image.height, Bitmap.Config.ARGB_8888)
+        padded.copyPixelsFromBuffer(plane.buffer)
         Bitmap.createBitmap(padded, 0, 0, image.width, image.height).also { padded.recycle() }
     } catch (_: Exception) { null }
 
     private fun analyse(bitmap: Bitmap) {
-        val input = InputImage.fromBitmap(bitmap, 0)
-        detector.process(input)
-            .addOnSuccessListener { found ->
-                getSharedPreferences("align_ai_settings", MODE_PRIVATE).edit()
-                    .putInt("frames_seen", getSharedPreferences("align_ai_settings", MODE_PRIVATE).getInt("frames_seen", 0) + 1)
-                    .putInt("objects_seen", found.size).apply()
-            }
-            .addOnCompleteListener { bitmap.recycle(); busy = false }
+        try {
+            detector.process(InputImage.fromBitmap(bitmap, 0))
+                .addOnSuccessListener { found ->
+                    prefs.edit().putInt("frames_seen", prefs.getInt("frames_seen", 0) + 1)
+                        .putInt("objects_seen", found.size).apply()
+                }
+                .addOnFailureListener { e -> setError("Frame analysis error: ${e.localizedMessage ?: "unknown"}") }
+                .addOnCompleteListener { bitmap.recycle(); busy = false }
+        } catch (e: Exception) {
+            bitmap.recycle()
+            busy = false
+            setError("Frame processing error: ${e.localizedMessage ?: "unknown"}")
+        }
     }
 
-    private fun stopCapture() {
+    private fun setError(message: String) {
+        prefs.edit().putBoolean("capture_running", false).putString("capture_error", message).apply()
+    }
+
+    private fun stopCaptureResources() {
         virtualDisplay?.release(); virtualDisplay = null
+        reader?.setOnImageAvailableListener(null, null)
         reader?.close(); reader = null
-        projection?.stop(); projection = null
-        getSharedPreferences("align_ai_settings", MODE_PRIVATE).edit().putBoolean("capture_running", false).apply()
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        projection?.let { p ->
+            try { p.stop() } catch (_: Exception) { }
+        }
+        projection = null
+        prefs.edit().putBoolean("capture_running", false).apply()
     }
 
     private fun createChannel() {
@@ -130,10 +162,9 @@ class ScreenCaptureService : Service() {
             .setContentIntent(pending).setOngoing(true).build()
     }
     override fun onDestroy() {
-        virtualDisplay?.release(); reader?.close(); projection?.stop()
-        detector.close()
-        thread.quitSafely()
-        getSharedPreferences("align_ai_settings", MODE_PRIVATE).edit().putBoolean("capture_running", false).apply()
+        stopCaptureResources()
+        if (::thread.isInitialized) thread.quitSafely()
+        try { detector.close() } catch (_: Exception) { }
         super.onDestroy()
     }
     override fun onBind(intent: Intent?): IBinder? = null
