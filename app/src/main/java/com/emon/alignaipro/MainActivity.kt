@@ -58,6 +58,7 @@ class MainActivity : ComponentActivity() {
             var captureOn by remember { mutableStateOf(prefs.getBoolean("capture_running", false)) }
             var frames by remember { mutableIntStateOf(prefs.getInt("frames_seen", 0)) }
             var objects by remember { mutableIntStateOf(prefs.getInt("objects_seen", 0)) }
+            var captureError by remember { mutableStateOf(prefs.getString("capture_error", "") ?: "") }
             var accessibilityOn by remember { mutableStateOf(AccessibilityStatus.isEnabled(this)) }
             val handler = remember { Handler(Looper.getMainLooper()) }
             DisposableEffect(Unit) {
@@ -66,6 +67,7 @@ class MainActivity : ComponentActivity() {
                         captureOn = prefs.getBoolean("capture_running", false)
                         frames = prefs.getInt("frames_seen", 0)
                         objects = prefs.getInt("objects_seen", 0)
+                        captureError = prefs.getString("capture_error", "") ?: ""
                         accessibilityOn = AccessibilityStatus.isEnabled(this@MainActivity)
                         handler.postDelayed(this, 1000)
                     }
@@ -95,6 +97,7 @@ class MainActivity : ComponentActivity() {
                                     Text(if (captureOn) "SCREEN CAPTURE ACTIVE" else "SCREEN CAPTURE STOPPED", color = if (captureOn) Cyan else Muted, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                                 }
                                 Text("Frames processed: $frames     Objects found: $objects", color = Color.White, fontSize = 13.sp)
+                                if (captureError.isNotBlank()) Text(captureError, color = Color(0xFFFF8A8A), fontSize = 11.sp)
                                 Button(onClick = {
                                     val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                                     captureLauncher.launch(mgr.createScreenCaptureIntent())
