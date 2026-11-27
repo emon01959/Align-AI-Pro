@@ -1,9 +1,14 @@
 package com.emon.alignaipro
 
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.media.projection.MediaProjectionManager
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.animation.animateColorAsState
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
@@ -24,12 +29,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.lifecycle.viewmodel.compose.viewModel
-import android.content.Context
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.ViewModelProvider
-import androidx.lifecycle.viewmodel.CreationExtras
-import android.app.Application
+import android.os.Handler
+import android.os.Looper
 
 private val Night = Color(0xFF070B18)
 private val Panel = Color(0xFF111A2E)
@@ -38,17 +39,46 @@ private val Violet = Color(0xFFB56BFF)
 private val Muted = Color(0xFF9AAAC4)
 
 class MainActivity : ComponentActivity() {
+    private val captureLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+            val service = Intent(this, ScreenCaptureService::class.java).apply {
+                action = ScreenCaptureService.ACTION_START
+                putExtra(ScreenCaptureService.EXTRA_RESULT_CODE, result.resultCode)
+                putExtra(ScreenCaptureService.EXTRA_DATA, result.data)
+            }
+            startForegroundService(service)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val prefs = getSharedPreferences("align_ai_settings", Context.MODE_PRIVATE)
         setContent {
             var autoBuild by remember { mutableStateOf(prefs.getBoolean("auto_build", false)) }
+            var captureOn by remember { mutableStateOf(prefs.getBoolean("capture_running", false)) }
+            var frames by remember { mutableIntStateOf(prefs.getInt("frames_seen", 0)) }
+            var objects by remember { mutableIntStateOf(prefs.getInt("objects_seen", 0)) }
+            var accessibilityOn by remember { mutableStateOf(AccessibilityStatus.isEnabled(this)) }
+            val handler = remember { Handler(Looper.getMainLooper()) }
+            DisposableEffect(Unit) {
+                val refresh = object : Runnable {
+                    override fun run() {
+                        captureOn = prefs.getBoolean("capture_running", false)
+                        frames = prefs.getInt("frames_seen", 0)
+                        objects = prefs.getInt("objects_seen", 0)
+                        accessibilityOn = AccessibilityStatus.isEnabled(this@MainActivity)
+                        handler.postDelayed(this, 1000)
+                    }
+                }
+                handler.post(refresh)
+                onDispose { handler.removeCallbacks(refresh) }
+            }
             AlignTheme {
                 Surface(Modifier.fillMaxSize(), color = Night) {
                     Column(
                         Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF101A35), Night)))
                             .verticalScroll(rememberScrollState()).padding(20.dp),
-                        verticalArrangement = Arrangement.spacedBy(18.dp)
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
                             AppMark(58)
@@ -58,26 +88,45 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                         Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(24.dp)) {
-                            Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                                Text("LIVE ALIGNMENT", color = Muted, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.2.sp)
-                                Row(verticalAlignment = Alignment.Bottom) {
-                                    Text("--", color = Cyan, fontSize = 52.sp, fontWeight = FontWeight.Black)
-                                    Text(" %", color = Muted, fontSize = 18.sp, modifier = Modifier.padding(bottom = 9.dp))
-                                    Spacer(Modifier.weight(1f))
-                                    AssistChip(onClick = {}, label = { Text("WAITING FOR SCREEN") }, leadingIcon = { Icon(Icons.Default.CenterFocusStrong, null) })
+                            Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Text("LIVE SCREEN ANALYSIS", color = Muted, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    StatusDot(captureOn)
+                                    Text(if (captureOn) "SCREEN CAPTURE ACTIVE" else "SCREEN CAPTURE STOPPED", color = if (captureOn) Cyan else Muted, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                                 }
-                                Text("Capture and detect targets to begin measurement.", color = Muted, fontSize = 13.sp)
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    TargetPill("TARGET A", Cyan)
-                                    TargetPill("TARGET B", Violet)
+                                Text("Frames processed: $frames     Objects found: $objects", color = Color.White, fontSize = 13.sp)
+                                Button(onClick = {
+                                    val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                                    captureLauncher.launch(mgr.createScreenCaptureIntent())
+                                }, modifier = Modifier.fillMaxWidth()) {
+                                    Icon(Icons.Default.CenterFocusStrong, null)
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(if (captureOn) "Start / Restart Screen Capture" else "Grant Screen Capture & Start")
+                                }
+                                OutlinedButton(onClick = {
+                                    stopService(Intent(this@MainActivity, ScreenCaptureService::class.java))
+                                    prefs.edit().putBoolean("capture_running", false).apply()
+                                }, modifier = Modifier.fillMaxWidth()) { Text("Stop Capture") }
+                            }
+                        }
+                        Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(20.dp)) {
+                            Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Text("ACCESSIBILITY SERVICE", color = Color.White, fontWeight = FontWeight.Bold)
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    StatusDot(accessibilityOn)
+                                    Text(if (accessibilityOn) "ENABLED" else "NOT ENABLED", color = if (accessibilityOn) Cyan else Muted, fontSize = 12.sp)
+                                }
+                                Text("Open Android Accessibility settings and enable Align AI Pro manually. Android requires your explicit approval.", color = Muted, fontSize = 12.sp)
+                                Button(onClick = { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }, modifier = Modifier.fillMaxWidth()) {
+                                    Text("Open Accessibility Settings")
                                 }
                             }
                         }
-                        Text("ALIGNMENT ENGINES", color = Color.White, fontWeight = FontWeight.Bold, letterSpacing = 1.2.sp)
-                        EngineCard("01", "Horizontal Position Engine", "Measures left/right displacement", Cyan)
-                        EngineCard("02", "Rotation Engine", "Measures angle and tilt difference", Violet)
-                        EngineCard("03", "Predictive Landing Engine", "Estimates landing alignment and risk", Color(0xFFFFC76A))
-                        Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(22.dp)) {
+                        Text("DETECTION ENGINE", color = Color.White, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                        EngineCard("01", "Live Object Detection", "On-device ML Kit object detection", Cyan)
+                        EngineCard("02", "Target A / B Assignment", "Next stage: identify and lock target anchors", Violet)
+                        EngineCard("03", "Alignment Measurement", "Next stage: corners, center, angle and landing", Color(0xFFFFC76A))
+                        Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(20.dp)) {
                             Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Icon(Icons.Default.Bolt, null, tint = Violet)
@@ -88,15 +137,15 @@ class MainActivity : ComponentActivity() {
                                         prefs.edit().putBoolean("auto_build", it).apply()
                                     })
                                 }
-                                Text(if (autoBuild) "ENABLED · safety validation still required" else "DISABLED · manual measurement mode", color = if (autoBuild) Cyan else Muted, fontSize = 12.sp)
-                                Text("Auto-BUILD cannot bypass screen-capture/accessibility permission prompts or validation checks.", color = Muted, fontSize = 11.sp)
+                                Text(if (autoBuild) "ENABLED · execution still safety-locked" else "DISABLED · detection only", color = if (autoBuild) Cyan else Muted, fontSize = 12.sp)
+                                Text("Build actions are not yet implemented in this version. Keep OFF until target validation is complete.", color = Muted, fontSize = 11.sp)
                             }
                         }
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             StatCard("HISTORY", "LOCAL", Icons.Default.History, Modifier.weight(1f))
                             StatCard("PROFILE", "PRO", Icons.Default.Tune, Modifier.weight(1f))
                         }
-                        Text("ALIGN AI PRO  •  v1.0.0", color = Muted, fontSize = 10.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
+                        Text("ALIGN AI PRO  •  v1.1.0", color = Muted, fontSize = 10.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
                     }
                 }
             }
@@ -107,22 +156,15 @@ class MainActivity : ComponentActivity() {
 @Composable private fun AlignTheme(content: @Composable () -> Unit) {
     MaterialTheme(colorScheme = darkColorScheme(primary = Cyan, secondary = Violet, background = Night, surface = Panel), content = content)
 }
-
+@Composable private fun StatusDot(active: Boolean) {
+    Box(Modifier.padding(end = 8.dp).size(9.dp).background(if (active) Cyan else Muted, RoundedCornerShape(50)))
+}
 @Composable private fun AppMark(size: Int) {
     Box(Modifier.size(size.dp).background(Brush.linearGradient(listOf(Cyan, Violet)), RoundedCornerShape(18.dp)).padding(2.dp)
         .background(Night, RoundedCornerShape(16.dp)), contentAlignment = Alignment.Center) {
         Icon(Icons.Default.CenterFocusStrong, null, tint = Cyan, modifier = Modifier.size((size * .62f).dp))
     }
 }
-
-@Composable private fun TargetPill(label: String, color: Color) {
-    Row(Modifier.border(1.dp, color.copy(alpha=.7f), RoundedCornerShape(50)).padding(horizontal=12.dp, vertical=7.dp), verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(7.dp).background(color, RoundedCornerShape(50)))
-        Spacer(Modifier.width(7.dp))
-        Text(label, color = color, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-    }
-}
-
 @Composable private fun EngineCard(number: String, name: String, description: String, color: Color) {
     Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(18.dp)) {
         Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -135,7 +177,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
-
 @Composable private fun StatCard(title: String, value: String, icon: androidx.compose.ui.graphics.vector.ImageVector, modifier: Modifier = Modifier) {
     Card(modifier, colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(18.dp)) {
         Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
